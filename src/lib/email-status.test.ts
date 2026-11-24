@@ -567,3 +567,66 @@ test("RESEND_REGION picks a known Resend region and ignores anything else", () =
   assert.deepEqual(resendRegionOption({ RESEND_REGION: "mars-1" }), {});
   assert.deepEqual(resendRegionOption({}), {});
 });
+
+const SMTP_ENV = {
+  EMAIL_DRIVER: "smtp",
+  SMTP_HOST: "smtp.acme.com",
+  SMTP_PORT: "587",
+};
+
+test("SMTP without a host is reported as not connected, naming the variable", async () => {
+  const status = await getEmailStatus({
+    env: { EMAIL_DRIVER: "smtp" },
+    settings,
+  });
+
+  assert.equal(status.state, "smtp_unconfigured");
+  assert.match((status as { message: string }).message, /SMTP_HOST/);
+});
+
+test("SMTP with no address of the organization's to send from asks for one", async () => {
+  assert.deepEqual(
+    await getEmailStatus({
+      env: SMTP_ENV,
+      settings: resolveSettings({ ...stored, senderAddress: null }, SMTP_ENV),
+    }),
+    { host: "smtp.acme.com", state: "smtp_no_sender" },
+  );
+});
+
+test("SMTP is working only once a test email has got through", async () => {
+  assert.deepEqual(
+    await getEmailStatus({
+      env: SMTP_ENV,
+      settings: resolveSettings(stored, SMTP_ENV),
+    }),
+    {
+      host: "smtp.acme.com",
+      port: 587,
+      senderAddress: "sign@acme.com",
+      state: "smtp",
+      tested: false,
+    },
+  );
+
+  const tested = resolveSettings(
+    { ...stored, emailReadyAt: 1_800_000_100 },
+    SMTP_ENV,
+  );
+
+  assert.equal(
+    (
+      (await getEmailStatus({ env: SMTP_ENV, settings: tested })) as {
+        tested: boolean;
+      }
+    ).tested,
+    true,
+  );
+  assert.equal(
+    emailNeedsAttention(resolveSettings(stored, SMTP_ENV), SMTP_ENV),
+    true,
+  );
+  assert.equal(emailNeedsAttention(tested, SMTP_ENV), false);
+  // A test that once got through does not cover settings that are now gone.
+  assert.equal(emailNeedsAttention(tested, { EMAIL_DRIVER: "smtp" }), true);
+});

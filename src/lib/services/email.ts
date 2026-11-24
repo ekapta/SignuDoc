@@ -2,12 +2,22 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdir, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 
+import nodemailer, { type SentMessageInfo, type Transporter } from "nodemailer";
 import { Resend } from "resend";
 
 import { getSettings } from "../settings.ts";
 import { type EmailTemplateKind } from "../types/domain.ts";
-import { getEnv, isLocalDeployment, type EnvSource } from "../utils/env.ts";
-import { buildEmailAddresses, type EmailAddresses } from "./email-addresses.ts";
+import {
+  getEnv,
+  isLocalDeployment,
+  readEnv,
+  type EnvSource,
+} from "../utils/env.ts";
+import {
+  buildEmailAddresses,
+  isResendTestSender,
+  type EmailAddresses,
+} from "./email-addresses.ts";
 import { CAPTURED_MESSAGE_ID_PREFIX } from "./captured-email.ts";
 import {
   assertServiceConfig,
@@ -18,11 +28,15 @@ import {
 // come from RESEND_FROM_EMAIL and SUPPORT_EMAIL when those are set, and from
 // the install's settings otherwise, and are looked up when a message is sent.
 const EMAIL_ENV_KEYS = ["RESEND_API_KEY"] as const;
+const SMTP_ENV_KEYS = ["SMTP_HOST"] as const;
 
 const DEFAULT_CAPTURE_DIR = ".data/outbox";
 const DEFAULT_CAPTURE_SENDER_ADDRESS = "dev@signudoc.localhost";
+const DEFAULT_SMTP_PORT = 587;
+const SMTP_CONNECTION_TIMEOUT_MS = 10_000;
+const SMTP_SOCKET_TIMEOUT_MS = 30_000;
 
-export type EmailDriver = "capture" | "resend";
+export type EmailDriver = "capture" | "resend" | "smtp";
 
 export type EmailAttachment = {
   content: Uint8Array;
@@ -72,6 +86,8 @@ type CreateEmailServiceOptions = {
   /** Replaced in tests, where there is no database to read settings from. */
   resolveAddresses?: () => Promise<EmailAddresses>;
   resendClient?: Resend;
+  /** Replaced in tests, so that nothing connects to a mail server. */
+  smtpTransport?: SmtpTransport;
   /** Replaced in tests, so that they do not really wait. */
   wait?: (milliseconds: number) => Promise<void>;
 };
@@ -193,13 +209,174 @@ export function resolveEmailDriver(env: EnvSource = process.env): EmailDriver {
     return "resend";
   }
 
-  if (configuredDriver === "capture" || configuredDriver === "resend") {
+  if (
+    configuredDriver === "capture" ||
+    configuredDriver === "resend" ||
+    configuredDriver === "smtp"
+  ) {
     return configuredDriver;
   }
 
   throw new Error(
-    `Unknown EMAIL_DRIVER "${configuredDriver}". Use "resend" or "capture".`,
+    `Unknown EMAIL_DRIVER "${configuredDriver}". Use "resend", "smtp" or "capture".`,
   );
+}
+
+function readBooleanEnv(
+  env: EnvSource,
+  variableName: string,
+  fallback: boolean,
+): boolean {
+  const value = readEnv(env, variableName)?.toLowerCase();
+
+  if (value === undefined) {
+    return fallback;
+  }
+
+  if (["1", "true", "yes", "on"].includes(value)) {
+    return true;
+  }
+
+  if (["0", "false", "no", "off"].includes(value)) {
+    return false;
+  }
+
+  throw new Error(`${variableName} must be "true" or "false".`);
+}
+
+/**
+ * Sends through an SMTP server, such as an organization's own mail relay.
+ * Configured with SMTP_HOST, SMTP_PORT, SMTP_SECURE, SMTP_REQUIRE_TLS,
+ * SMTP_USER, SMTP_PASS and SMTP_TLS_REJECT_UNAUTHORIZED.
+ */
+export type SmtpConfig = {
+  auth?: { pass: string; user: string };
+  host: string;
+  port: number;
+  requireTLS: boolean;
+  secure: boolean;
+  tls: { rejectUnauthorized: boolean };
+};
+
+/**
+ * The SMTP server settings from the environment. Throws, naming the
+ * variable, when SMTP_HOST is missing or a value cannot be read.
+ */
+export function readSmtpConfig(env: EnvSource = process.env): SmtpConfig {
+  assertServiceConfig("email", SMTP_ENV_KEYS, env);
+
+  const portValue = readEnv(env, "SMTP_PORT");
+  const port = portValue === undefined ? DEFAULT_SMTP_PORT : Number(portValue);
+
+  if (!Number.isInteger(port) || port <= 0 || port > 65_535) {
+    throw new Error(`SMTP_PORT "${portValue}" is not a valid port.`);
+  }
+
+  const user = readEnv(env, "SMTP_USER");
+
+  return {
+    ...(user ? { auth: { pass: readEnv(env, "SMTP_PASS") ?? "", user } } : {}),
+    host: readEnv(env, "SMTP_HOST")!,
+    port,
+    requireTLS: readBooleanEnv(env, "SMTP_REQUIRE_TLS", false),
+    // true: TLS from the first byte (usually port 465). false: plain
+    // connection upgraded with STARTTLS when the server offers it.
+    secure: readBooleanEnv(env, "SMTP_SECURE", port === 465),
+    tls: {
+      rejectUnauthorized: readBooleanEnv(
+        env,
+        "SMTP_TLS_REJECT_UNAUTHORIZED",
+        true,
+      ),
+    },
+  };
+}
+
+/** The part of a nodemailer transport used here. Replaced by a fake in tests. */
+export type SmtpTransport = Pick<Transporter<SentMessageInfo>, "sendMail">;
+
+function createSmtpEmailService(
+  env: EnvSource,
+  resolveAddresses: () => Promise<EmailAddresses>,
+  smtpTransport?: SmtpTransport,
+): EmailService {
+  const transport =
+    smtpTransport ??
+    nodemailer.createTransport({
+      ...readSmtpConfig(env),
+      // Without these a server that stops answering holds the request for
+      // minutes; a signer would be left waiting on the page.
+      connectionTimeout: SMTP_CONNECTION_TIMEOUT_MS,
+      greetingTimeout: SMTP_CONNECTION_TIMEOUT_MS,
+      socketTimeout: SMTP_SOCKET_TIMEOUT_MS,
+    });
+
+  async function deliver(
+    message: TransactionalEmailMessage,
+    config: EmailAddresses,
+  ): Promise<EmailDeliveryResult> {
+    const info = await transport.sendMail({
+      ...(message.attachments?.length
+        ? {
+            attachments: message.attachments.map((attachment) => ({
+              content: Buffer.from(attachment.content),
+              contentType: attachment.contentType,
+              filename: attachment.filename,
+            })),
+          }
+        : {}),
+      from: config.senderAddress,
+      html: message.htmlBody,
+      replyTo: message.replyTo ?? config.supportAddress ?? undefined,
+      subject: message.subject,
+      text: message.textBody,
+      to: message.to,
+    });
+
+    const accepted = info.accepted.map(String);
+    const rejected = info.rejected.map(String);
+
+    if (accepted.length === 0) {
+      throw new Error(`The SMTP server refused the message to ${message.to}.`);
+    }
+
+    return { accepted, messageId: info.messageId, rejected };
+  }
+
+  async function resolveSmtpAddresses(): Promise<EmailAddresses> {
+    const config = await resolveAddresses();
+
+    // Resend's shared testing address is only a fallback for Resend; an
+    // SMTP server needs a sender it accepts mail from.
+    if (isResendTestSender(config.senderAddress)) {
+      throw new Error(
+        "Set the address email is sent from (Settings, Organization, or RESEND_FROM_EMAIL) before sending through SMTP.",
+      );
+    }
+
+    return config;
+  }
+
+  return {
+    async send(message) {
+      return deliver(message, await resolveSmtpAddresses());
+    },
+    async sendBatch(messages) {
+      if (messages.length === 0) {
+        return [];
+      }
+
+      const config = await resolveSmtpAddresses();
+      const results: EmailDeliveryResult[] = [];
+
+      // SMTP has no batch call: each message is its own delivery.
+      for (const message of messages) {
+        results.push(await deliver(message, config));
+      }
+
+      return results;
+    },
+  };
 }
 
 /**
@@ -355,10 +532,15 @@ export function createEmailService({
   env = process.env,
   resolveAddresses = () => resolveEmailAddresses(env),
   resendClient,
+  smtpTransport,
   wait = waitFor,
 }: CreateEmailServiceOptions = {}): EmailService {
   if (!resendClient && resolveEmailDriver(env) === "capture") {
     return createCaptureEmailService(env, resolveAddresses);
+  }
+
+  if (!resendClient && resolveEmailDriver(env) === "smtp") {
+    return createSmtpEmailService(env, resolveAddresses, smtpTransport);
   }
 
   if (!resendClient) {
