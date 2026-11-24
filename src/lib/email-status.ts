@@ -6,7 +6,7 @@ import {
   getAddressDomain,
   isResendTestSender,
 } from "./services/email-addresses.ts";
-import { resolveEmailDriver } from "./services/email.ts";
+import { readSmtpConfig, resolveEmailDriver } from "./services/email.ts";
 import {
   getSettings,
   markEmailReady,
@@ -63,7 +63,22 @@ export type EmailStatus =
       senderAddress: string;
     }
   | { state: "ready"; domain: string; senderAddress: string }
-  | { state: "error"; message: string; senderAddress: string };
+  | { state: "error"; message: string; senderAddress: string }
+  /** EMAIL_DRIVER=smtp, but the SMTP settings are missing or unreadable. */
+  | { state: "smtp_unconfigured"; message: string }
+  /** SMTP is set up, but there is no address of the organization's to send from. */
+  | { state: "smtp_no_sender"; host: string }
+  /**
+   * Sending through an SMTP server. Nothing can be asked of the server
+   * ahead of time, so only a test email that gets through proves it works.
+   */
+  | {
+      state: "smtp";
+      host: string;
+      port: number;
+      senderAddress: string;
+      tested: boolean;
+    };
 
 /** The parts of the Resend SDK used here. Replaced by a fake in tests. */
 const RESEND_REGIONS = [
@@ -370,6 +385,46 @@ async function findDomain(
   };
 }
 
+/**
+ * SMTP has no domain to look up. The settings are checked as far as they
+ * can be without connecting, and a test email that got through (which sets
+ * emailReadyAt) is what counts as working.
+ */
+async function inspectSmtp(
+  env: EnvSource,
+  settings?: ResolvedSettings,
+): Promise<EmailStatus> {
+  let host: string;
+  let port: number;
+
+  try {
+    ({ host, port } = readSmtpConfig(env));
+  } catch (error) {
+    return {
+      message:
+        error instanceof Error ? error.message : "SMTP settings are invalid.",
+      state: "smtp_unconfigured",
+    };
+  }
+
+  const resolvedSettings = settings ?? (await getSettings(env));
+  const senderAddress = extractEmailAddress(
+    buildEmailAddresses(resolvedSettings).senderAddress,
+  );
+
+  if (isResendTestSender(senderAddress)) {
+    return { host, state: "smtp_no_sender" };
+  }
+
+  return {
+    host,
+    port,
+    senderAddress,
+    state: "smtp",
+    tested: resolvedSettings.emailReadyAt !== null,
+  };
+}
+
 // Finds out everything short of the domain's DNS records, which cost one
 // more request and are fetched by whoever needs them.
 async function inspectEmail({
@@ -386,6 +441,15 @@ async function inspectEmail({
       domainId: null,
       markReady: noop,
       status: { state: "capture" },
+    };
+  }
+
+  if (!domainsClient && resolveEmailDriver(env) === "smtp") {
+    return {
+      client: null,
+      domainId: null,
+      markReady: noop,
+      status: await inspectSmtp(env, settings),
     };
   }
 
@@ -557,8 +621,16 @@ export function emailNeedsAttention(
   env: EnvSource = process.env,
 ): boolean {
   try {
-    if (resolveEmailDriver(env) === "capture") {
+    const driver = resolveEmailDriver(env);
+
+    if (driver === "capture") {
       return false;
+    }
+
+    // Settings that cannot be read mean nothing is sent, whatever an
+    // earlier test email found.
+    if (driver === "smtp") {
+      readSmtpConfig(env);
     }
   } catch {
     return true;

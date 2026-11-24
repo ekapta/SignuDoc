@@ -709,7 +709,9 @@ function EmailSetupPanel() {
   const canSendTest =
     status !== null &&
     status.state !== "missing_key" &&
-    status.state !== "capture";
+    status.state !== "capture" &&
+    status.state !== "smtp_unconfigured" &&
+    status.state !== "smtp_no_sender";
 
   return (
     <div className="space-y-5 border-t border-(--border) pt-8" id="email-setup">
@@ -947,6 +949,41 @@ function describeEmailStatus(status: EmailStatus): {
         ready: false,
         title: "Email could not be checked",
       };
+    case "smtp_unconfigured":
+      return {
+        lines: [
+          `EMAIL_DRIVER is set to smtp, but the SMTP settings cannot be used: ${status.message}`,
+          "Set SMTP_HOST (and SMTP_PORT and the other SMTP_ settings if needed) where this site runs, restart the app, then reload this page.",
+        ],
+        ready: false,
+        title: "Email is not connected",
+      };
+    case "smtp_no_sender":
+      return {
+        lines: [
+          `Email goes through ${status.host}, but no address to send from is set yet.`,
+          'Enter an address the mail server accepts in "Send email from" above and save, then send yourself a test email.',
+        ],
+        ready: false,
+        title: "Choose the address email is sent from",
+      };
+    case "smtp":
+      return status.tested
+        ? {
+            lines: [
+              `Emails are sent from ${status.senderAddress} through ${status.host}:${String(status.port)}, and a test email got through.`,
+            ],
+            ready: true,
+            title: "Email is working",
+          }
+        : {
+            lines: [
+              `Emails are sent from ${status.senderAddress} through ${status.host}:${String(status.port)}.`,
+              "Send yourself a test email. If it arrives, email is working.",
+            ],
+            ready: false,
+            title: "Send a test email to finish",
+          };
   }
 }
 

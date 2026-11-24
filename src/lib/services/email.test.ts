@@ -7,6 +7,7 @@ import {
   canSendEmail,
   createEmailService,
   createLazyEmailService,
+  readSmtpConfig,
   type EmailService,
 } from "./email.ts";
 
@@ -181,5 +182,148 @@ test("signup knows when there is no email provider to send with (issue #95)", ()
       NODE_ENV: "production",
     }),
     false,
+  );
+});
+
+// The SMTP driver, with a fake transport in place of a mail server.
+
+type SentMail = Record<string, unknown>;
+
+function smtpService(
+  answer: (mail: SentMail) => { accepted: string[]; rejected: string[] },
+  senderAddress = "Example <hello@example.test>",
+) {
+  const sent: SentMail[] = [];
+  const service = createEmailService({
+    env: { EMAIL_DRIVER: "smtp", SMTP_HOST: "smtp.example.test" },
+    resolveAddresses: async () => ({
+      senderAddress,
+      supportAddress: "help@example.test",
+    }),
+    smtpTransport: {
+      sendMail: (async (mail: SentMail) => {
+        sent.push(mail);
+
+        return { ...answer(mail), messageId: `<${String(sent.length)}@x>` };
+      }) as never,
+    },
+  });
+
+  return { sent, service };
+}
+
+const acceptAll = (mail: SentMail) => ({
+  accepted: [String(mail.to)],
+  rejected: [],
+});
+
+test("SMTP sends the message, its attachments and reply-to address", async () => {
+  const { sent, service } = smtpService(acceptAll);
+  const result = await service.send({
+    ...MESSAGE,
+    attachments: [
+      {
+        content: new Uint8Array([1, 2, 3]),
+        contentType: "application/pdf",
+        filename: "signed.pdf",
+      },
+    ],
+    htmlBody: "<p>Attached.</p>",
+  });
+
+  assert.deepEqual(result, {
+    accepted: ["signer@example.test"],
+    messageId: "<1@x>",
+    rejected: [],
+  });
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].from, "Example <hello@example.test>");
+  assert.equal(sent[0].to, "signer@example.test");
+  assert.equal(sent[0].replyTo, "help@example.test");
+  assert.equal(sent[0].html, "<p>Attached.</p>");
+  assert.deepEqual(
+    (sent[0].attachments as { filename: string }[]).map((a) => a.filename),
+    ["signed.pdf"],
+  );
+});
+
+test("SMTP sends a batch one message at a time", async () => {
+  const { sent, service } = smtpService(acceptAll);
+  const results = await service.sendBatch([
+    { ...MESSAGE, to: "a@example.test" },
+    { ...MESSAGE, to: "b@example.test" },
+  ]);
+
+  assert.deepEqual(
+    results.map((result) => result.accepted),
+    [["a@example.test"], ["b@example.test"]],
+  );
+  assert.equal(sent.length, 2);
+});
+
+test("SMTP fails a message the server refuses", async () => {
+  const { service } = smtpService((mail) => ({
+    accepted: [],
+    rejected: [String(mail.to)],
+  }));
+
+  await assert.rejects(service.send(MESSAGE), /refused the message/);
+});
+
+test("SMTP will not send from Resend's shared test address", async () => {
+  const { sent, service } = smtpService(
+    acceptAll,
+    "Example <onboarding@resend.dev>",
+  );
+
+  await assert.rejects(
+    service.send(MESSAGE),
+    /Set the address email is sent from/,
+  );
+  assert.equal(sent.length, 0);
+});
+
+test("SMTP settings are read from the environment", () => {
+  assert.deepEqual(readSmtpConfig({ SMTP_HOST: "smtp.kku.ac.th" }), {
+    host: "smtp.kku.ac.th",
+    port: 587,
+    requireTLS: false,
+    secure: false,
+    tls: { rejectUnauthorized: true },
+  });
+  assert.deepEqual(
+    readSmtpConfig({
+      SMTP_HOST: "smtp.example.test",
+      SMTP_PASS: "secret",
+      SMTP_PORT: "465",
+      SMTP_REQUIRE_TLS: "true",
+      SMTP_TLS_REJECT_UNAUTHORIZED: "false",
+      SMTP_USER: "mailer",
+    }),
+    {
+      auth: { pass: "secret", user: "mailer" },
+      host: "smtp.example.test",
+      port: 465,
+      requireTLS: true,
+      secure: true,
+      tls: { rejectUnauthorized: false },
+    },
+  );
+  assert.throws(() => readSmtpConfig({}), /SMTP_HOST/);
+  assert.throws(
+    () => readSmtpConfig({ SMTP_HOST: "x", SMTP_PORT: "abc" }),
+    /SMTP_PORT/,
+  );
+  assert.throws(
+    () => readSmtpConfig({ SMTP_HOST: "x", SMTP_SECURE: "maybe" }),
+    /SMTP_SECURE/,
+  );
+});
+
+test("SMTP counts as able to send only once SMTP_HOST is set", () => {
+  assert.equal(canSendEmail({ EMAIL_DRIVER: "smtp" }), false);
+  assert.equal(
+    canSendEmail({ EMAIL_DRIVER: "smtp", SMTP_HOST: "smtp.example.test" }),
+    true,
   );
 });
