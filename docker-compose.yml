@@ -1,23 +1,63 @@
-# Local Postgres for development and the end-to-end test.
-#   npm run db:start    start it and apply migrations
-#   npm run db:stop     stop it (data is kept)
-#   npm run db:reset    wipe it and start fresh
+# Production: the app and its Postgres, for a Portainer stack or
+# `docker compose up -d --build`. Local development uses
+# docker-compose.dev.yml (npm run db:start) instead.
+#
+# Set these in the stack's environment (or a .env file next to this one):
+#   DB_PASSWORD          openssl rand -hex 24 (hex: it goes into a URL)
+#   APP_URL              the public https:// address people open
+#   BETTER_AUTH_SECRET   openssl rand -hex 32; never change it afterwards
+#   SETUP_TOKEN          asked for on /setup, so only you can set the site up
+# Optional: APP_PORT (3000), RETENTION_JOB_SECRET, SUPPORT_EMAIL,
+# RESEND_FROM_EMAIL, TZ, and the SMTP_ settings (KKU's by default).
+#
+# APP_URL must be https: put a TLS reverse proxy in front of APP_PORT.
+
 services:
   db:
     image: postgres:17
+    restart: unless-stopped
     environment:
       POSTGRES_USER: signudoc
-      POSTGRES_PASSWORD: signudoc
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD}
       POSTGRES_DB: signudoc
-    ports:
-      - "127.0.0.1:5432:5432"
     volumes:
-      - signudoc-db:/var/lib/postgresql/data
+      - db-data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U signudoc -d signudoc"]
-      interval: 2s
+      interval: 5s
       timeout: 3s
       retries: 30
 
+  app:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "${APP_PORT:-3000}:3000"
+    environment:
+      DATABASE_URL: postgres://signudoc:${DB_PASSWORD:?Set DB_PASSWORD}@db:5432/signudoc
+      APP_URL: ${APP_URL:?Set APP_URL}
+      BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:?Set BETTER_AUTH_SECRET}
+      SETUP_TOKEN: ${SETUP_TOKEN:-}
+      RETENTION_JOB_SECRET: ${RETENTION_JOB_SECRET:-}
+      SUPPORT_EMAIL: ${SUPPORT_EMAIL:-}
+      RESEND_FROM_EMAIL: ${RESEND_FROM_EMAIL:-}
+      EMAIL_DRIVER: smtp
+      SMTP_HOST: ${SMTP_HOST:-smtp.kku.ac.th}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_SECURE: ${SMTP_SECURE:-false}
+      SMTP_REQUIRE_TLS: ${SMTP_REQUIRE_TLS:-true}
+      SMTP_TLS_REJECT_UNAUTHORIZED: ${SMTP_TLS_REJECT_UNAUTHORIZED:-false}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+      STORAGE_DRIVER: local
+      TZ: ${TZ:-Asia/Bangkok}
+    volumes:
+      # Signed PDFs live here: losing this volume loses the documents.
+      - storage:/app/.data/storage
+
 volumes:
-  signudoc-db:
+  db-data:
+  storage:
